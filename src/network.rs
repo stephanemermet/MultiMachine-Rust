@@ -1,4 +1,5 @@
 pub mod discovery;
+mod health;
 mod tls;
 mod udp;
 use crate::{
@@ -83,8 +84,13 @@ pub struct Peer {
     catalog: Arc<Catalog>,
     sink: Sink,
     udp: Option<Arc<udp::MotionPath>>,
-    received: AtomicU64,
+    pong: AtomicU64,
     rtt: AtomicU64,
+    activity: AtomicU64,
+    health_ready: Notify,
+    control_sent: AtomicU64,
+    held: Mutex<health::Held>,
+    sensitive: AtomicBool,
 }
 pub struct Connection {
     pub peer: Arc<Peer>,
@@ -121,8 +127,13 @@ impl Connection {
             catalog,
             sink,
             udp,
-            received: AtomicU64::new(now()),
+            pong: AtomicU64::new(0),
             rtt: AtomicU64::new(u64::MAX),
+            activity: AtomicU64::new(now()),
+            health_ready: Notify::new(),
+            control_sent: AtomicU64::new(0),
+            held: Mutex::new(health::Held::default()),
+            sensitive: AtomicBool::new(false),
         });
         Self {
             peer,
@@ -144,7 +155,6 @@ impl Connection {
         guard(peer.clone(), async move {
             loop {
                 let frame: Frame = read_frame(&mut cr, CONTROL_FRAME).await?;
-                p.received.store(now(), Ordering::Relaxed);
                 ensure!(
                     !matches!(frame, Frame::Motion { .. }),
                     "Mouvement non fiable sur TCP"
@@ -155,7 +165,15 @@ impl Connection {
         let p = peer.clone();
         guard(peer.clone(), async move {
             loop {
-                let item = p.tx.lock().queue.pop_front();
+                let (item, deadline) = {
+                    let mut tx = p.tx.lock();
+                    let item = tx
+                        .queue
+                        .pop_front()
+                        .or_else(|| tx.sender.as_mut().and_then(|s| s.checkpoint(now())));
+                    let deadline = tx.sender.as_ref().and_then(Sender::checkpoint_deadline);
+                    (item, deadline)
+                };
                 if let Some(frame) = item {
                     let movement = frame.motion_key().is_some();
                     if let Frame::Motion { motion } = frame {
@@ -165,16 +183,25 @@ impl Connection {
                             false
                         };
                         if !sent {
-                            write_frame(&mut cw, &Frame::Final { motion }, CONTROL_FRAME).await?
+                            write_frame(&mut cw, &Frame::Final { motion }, CONTROL_FRAME).await?;
+                            p.control_sent.fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
-                        write_frame(&mut cw, &frame, CONTROL_FRAME).await?
+                        write_frame(&mut cw, &frame, CONTROL_FRAME).await?;
+                        p.control_sent.fetch_add(1, Ordering::Relaxed);
                     }
                     if movement {
                         tokio::time::sleep(Duration::from_millis(4)).await;
                     }
                 } else {
-                    p.ready.notified().await;
+                    if let Some(deadline) = deadline {
+                        tokio::select! {
+                            _ = p.ready.notified() => {},
+                            _ = tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(now()))) => {}
+                        }
+                    } else {
+                        p.ready.notified().await;
+                    }
                 }
             }
         });
@@ -189,6 +216,7 @@ impl Connection {
             loop {
                 let message: Bulk = read_frame(&mut br, BULK_FRAME).await?;
                 message.validate()?;
+                p.touch();
                 match message {
                     Bulk::Clipboard { offer } => (p.sink)(p.id, Event::Clipboard(offer)),
                     Bulk::Drag { offer } => (p.sink)(p.id, Event::Drag(offer)),
@@ -238,35 +266,26 @@ impl Connection {
         });
         let p = peer.clone();
         guard(peer.clone(), async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(20));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut health = health::Health::default();
             loop {
-                timer.tick().await;
-                let mut tx = p.tx.lock();
-                if let Some(frame) = tx.sender.as_mut().and_then(|s| s.checkpoint(now())) {
-                    if tx.queue.len() >= 4096 {
-                        drop(tx);
-                        anyhow::bail!("Contrôle saturé")
-                    }
-                    tx.queue.push_back(frame);
-                    p.ready.notify_one();
+                let tick = now();
+                let step = health
+                    .step(
+                        tick,
+                        p.active() || p.sensitive.load(Ordering::Relaxed),
+                        p.pong.load(Ordering::Relaxed),
+                    )
+                    .context("Connexion sans réponse")?;
+                if step.probe {
+                    p.send(Control::Ping {
+                        id: tick,
+                        reply: false,
+                    });
                 }
-            }
-        });
-        let p = peer.clone();
-        guard(peer.clone(), async move {
-            let mut timer = tokio::time::interval(Duration::from_secs(1));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                timer.tick().await;
-                ensure!(
-                    now().saturating_sub(p.received.load(Ordering::Relaxed)) < 5000,
-                    "Connexion sans réponse"
-                );
-                p.send(Control::Ping {
-                    id: now(),
-                    reply: false,
-                });
+                tokio::select! {
+                    _ = p.health_ready.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(step.wake_at.saturating_sub(now()))) => {}
+                }
             }
         });
         if let Some(path) = &peer.udp {
@@ -281,6 +300,42 @@ fn guard(peer: Arc<Peer>, fut: impl std::future::Future<Output = Result<()>> + S
     });
 }
 impl Peer {
+    fn observe(&self, event: &Control) {
+        // Keep fast failure detection while an input can remain pressed remotely
+        // or an OLE gesture is in flight, even if the pointer is stationary.
+        if !matches!(
+            event,
+            Control::Input {
+                input: Input::Move { .. } | Input::Wheel { .. },
+                ..
+            }
+        ) {
+            let mut held = self.held.lock();
+            self.sensitive.store(held.observe(event), Ordering::Relaxed);
+        }
+        self.touch();
+    }
+    fn touch(&self) {
+        let tick = now();
+        let previous = self.activity.swap(tick, Ordering::Relaxed);
+        if tick.saturating_sub(previous) >= health::ACTIVE_GRACE_MS {
+            self.health_ready.notify_one();
+        }
+        if let Some(path) = &self.udp {
+            path.touch();
+        }
+    }
+    pub fn active(&self) -> bool {
+        now().saturating_sub(self.activity.load(Ordering::Relaxed)) < health::ACTIVE_GRACE_MS
+    }
+    pub fn sent_packets(&self) -> (u64, u64) {
+        (
+            self.control_sent.load(Ordering::Relaxed),
+            self.udp
+                .as_ref()
+                .map_or(0, |path| path.packets.load(Ordering::Relaxed)),
+        )
+    }
     pub fn connected(&self) -> bool {
         !self.stop.is_cancelled()
     }
@@ -290,6 +345,8 @@ impl Peer {
     pub fn transport(&self) -> &'static str {
         if !self.hybrid() {
             "TCP classique"
+        } else if !self.active() {
+            "Hybride au repos"
         } else if self.udp.as_ref().is_some_and(|p| p.ready()) {
             "Hybride actif"
         } else {
@@ -318,6 +375,9 @@ impl Peer {
         if event.validate().is_err() {
             self.close("Entrée invalide");
             return false;
+        }
+        if !matches!(event, Control::Ping { .. }) {
+            self.observe(&event);
         }
         let mut tx = self.tx.lock();
         let frame = match &mut tx.sender {
@@ -369,12 +429,18 @@ impl Peer {
         for event in events {
             match event {
                 Control::Ping { id, reply: true } => {
-                    self.rtt.store(now().saturating_sub(id), Ordering::Relaxed)
+                    ensure!(id <= now(), "Réponse de contrôle invalide");
+                    self.pong.fetch_max(id, Ordering::Relaxed);
+                    self.rtt.store(now().saturating_sub(id), Ordering::Relaxed);
+                    self.health_ready.notify_one();
                 }
                 Control::Ping { id, reply: false } => {
                     self.send(Control::Ping { id, reply: true });
                 }
-                other => (self.sink)(self.id, Event::Control(other)),
+                other => {
+                    self.observe(&other);
+                    (self.sink)(self.id, Event::Control(other));
+                }
             }
         }
         Ok(())
@@ -383,6 +449,7 @@ impl Peer {
         if !self.connected() {
             return false;
         }
+        self.touch();
         if message.validate().is_err() || self.bulk.try_send(message).is_err() {
             self.close("Canal de transfert saturé ou invalide");
             return false;

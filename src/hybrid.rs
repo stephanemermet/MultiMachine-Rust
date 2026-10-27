@@ -109,6 +109,9 @@ impl Sender {
             None
         }
     }
+    pub fn checkpoint_deadline(&self) -> Option<u64> {
+        self.dirty.then_some(self.changed.saturating_add(60))
+    }
 }
 #[derive(Default)]
 pub struct Receiver {

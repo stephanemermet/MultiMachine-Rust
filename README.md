@@ -2,7 +2,7 @@
 
 Réécriture indépendante de MultiMachine pour **deux PC Windows 10/11 x64 sur le LAN**. L’application et le protocole sont écrits en Rust ; l’interface, les hooks et le glisser-déposer utilisent Win32/COM. Aucun runtime .NET, installateur ou droit administrateur n’est nécessaire à l’application.
 
-**Première livraison Rust : préversion 0.1.0.** Les tests automatisés Linux et Windows sous Wine sont décrits dans [VALIDATION.md](docs/VALIDATION.md). Ils ne constituent pas une recette sur deux Windows physiques. Le projet .NET reste indépendant et intact. Les deux produits ne peuvent pas communiquer entre eux.
+**Livraison Rust : préversion 0.1.1.** Les tests automatisés Linux et Windows sous Wine sont décrits dans [VALIDATION.md](docs/VALIDATION.md). Ils ne constituent pas une recette sur deux Windows physiques. Le projet .NET reste indépendant et intact. Les deux produits ne peuvent pas communiquer entre eux. Installer la même version Rust sur les deux PC pour bénéficier du fonctionnement au repos des deux côtés.
 
 ## Utilisation
 
@@ -13,9 +13,13 @@ Réécriture indépendante de MultiMachine pour **deux PC Windows 10/11 x64 sur 
 5. Ouvrir **Écrans…** une fois connectés : placer l’autre PC à gauche ou à droite et ajuster la hauteur. La disposition interne des écrans de chaque PC reste celle des réglages d’affichage Windows.
 6. Franchir le bord commun. Les périphériques physiques de l’un ou l’autre PC peuvent contrôler l’autre sans changer les rôles réseau. **Ctrl + Alt + F12** reprend la main. L’activité physique sur le PC recevant le contrôle interrompt le contrôle distant.
 
+La fenêtre se redimensionne et adapte ses options à la largeur et au DPI du moniteur. Une barre de défilement permet d’accéder au bas du formulaire si l’écran est trop petit. L’icône est intégrée au programme, à sa fenêtre et à la zone de notification.
+
 Le halo bleu apparaît aux deux extrémités du passage. L’option **Traces du curseur distant** active les traces Windows pendant la réception du contrôle et restaure le réglage antérieur au retour. Un journal permet la restauration au prochain lancement après un arrêt brutal.
 
 **Mouvement hybride UDP + TCP** est activé par défaut. Le décocher relance la connexion en TCP classique. Les clics, touches et défilements restent fiables ; les positions intermédiaires peuvent être remplacées. L’absence de réponse UDP déclenche le transport TCP de secours. La découverte utilise UDP 24883 ; le contrôle TLS et les mouvements UDP utilisent le même numéro de port, 24882 par défaut. Les transferts disposent d’une seconde connexion TLS. Le pare-feu du serveur doit autoriser les connexions locales au port choisi ; les politiques corporate ne sont pas contournées.
+
+Après deux secondes sans activité utile, les sondes UDP s’arrêtent et la surveillance TCP s’espace à 30 secondes. Une nouvelle opération réactive immédiatement la surveillance ; la première position peut utiliser TCP pendant la reprise UDP. Une touche ou un bouton maintenu, ou un glisser-déposer en cours, conserve une détection rapide des coupures. Le « ping TCP aller-retour » affiché pendant l’activité mesure la liaison et son traitement, pas la latence aller simple du curseur UDP. Aucun rafraîchissement de statistiques n’est effectué dans la fenêtre masquée ; aucun journal périodique de trafic n’est écrit. **Diagnostics** consigne les compteurs uniquement à la demande.
 
 Les options de démarrage et de connexion automatiques sont indépendantes. Le serveur continue d’écouter, le client réessaie toutes les trois secondes, quel que soit l’ordre de démarrage. La fenêtre se réduit dans la zone de notification ; le menu de l’icône permet d’ouvrir, d’arrêter ou de quitter l’application.
 
@@ -29,6 +33,8 @@ Les options de démarrage et de connexion automatiques sont indépendantes. Le s
 - Limites : 4 096 éléments, noms relatifs compatibles Windows de 259 unités UTF-16, 32 Mio de formats de presse-papier, 16 catalogues conservés. Liens symboliques, jonctions, volumes entiers et chemins sortant de la sélection sont refusés. Un fichier modifié après la copie peut faire échouer sa lecture : recopier alors la sélection.
 
 La compatibilité dépend des formats OLE exposés et acceptés par les applications. La recette Explorateur/Bureau, Codex et Outlook sur Windows est à effectuer avec [la matrice de vérification](docs/VALIDATION.md). Les fenêtres distantes, la session de connexion Windows et le bureau sécurisé UAC sont hors périmètre.
+
+Lors d’un changement de bureau Windows (notamment UAC), le contrôle en cours est annulé. Au retour sur le bureau normal, les hooks sont réinstallés et les anciennes entrées sont libérées pour permettre un nouveau franchissement. Les fenêtres exécutées en administrateur peuvent refuser les entrées d’une application sans élévation (UIPI) : cette récupération ne leur donne pas accès.
 
 ## Réglages, confidentialité et diagnostics
 

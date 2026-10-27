@@ -1,4 +1,4 @@
-use super::{drag, injector::Injector, platform::*};
+use super::{desktop, drag, injector::Injector, platform::*, storage};
 use multimachine_rust::{
     engine::{Effect, Engine},
     files::Catalog,
@@ -6,11 +6,14 @@ use multimachine_rust::{
     model::*,
     network::{Peer, now},
 };
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    sync::Arc,
+};
 use tokio::runtime::Handle;
 use windows::Win32::{
     Foundation::*,
-    UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{Accessibility::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 pub type Indicator = Arc<dyn Fn(Option<Monitor>, bool, bool) + Send + Sync>;
 #[derive(Clone)]
@@ -28,8 +31,50 @@ struct State {
     mouse: HHOOK,
     keyboard: HHOOK,
     window: HWND,
+    desktop_hook: HWINEVENTHOOK,
+    desktop_available: bool,
+    desktop_check: u64,
 }
 thread_local! {static STATE:RefCell<Option<State>>=const{RefCell::new(None)};}
+thread_local! {static DESKTOP_WINDOW:Cell<isize>=const{Cell::new(0)};}
+const DESKTOP_CHANGED: u32 = WM_APP + 20;
+
+fn install_hooks() -> anyhow::Result<(HHOOK, HHOOK)> {
+    unsafe {
+        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), Some(module()), 0)?;
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), Some(module()), 0) {
+            Ok(keyboard_hook) => Ok((mouse_hook, keyboard_hook)),
+            Err(error) => {
+                let _ = UnhookWindowsHookEx(mouse_hook);
+                Err(error.into())
+            }
+        }
+    }
+}
+unsafe extern "system" fn desktop_event(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    // WinEvents may re-enter the installing thread. Defer state changes to its
+    // own window, without borrowing the engine inside the callback.
+    DESKTOP_WINDOW.with(|window| {
+        if window.get() != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(window.get() as *mut _)),
+                    DESKTOP_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
+}
 impl InputThread {
     pub fn new(
         catalog: Arc<Catalog>,
@@ -52,9 +97,12 @@ impl InputThread {
                         (err_notice)(text);
                         dest.post(|| {
                             with(|s| {
-                                s.engine.emergency(now());
-                                if let Some(p) = &s.peer {
-                                    p.close("Injection refusée");
+                                s.check_desktop(false);
+                                if s.desktop_available {
+                                    s.engine.emergency(now());
+                                    if let Some(p) = &s.peer {
+                                        p.close("Injection refusée");
+                                    }
                                 }
                             })
                         });
@@ -80,19 +128,12 @@ impl InputThread {
                     });
                     let drag = drag::Drag::new(catalog.clone(), runtime, sink, notice.clone())?;
                     let window = hidden("MultiMachineRust.Input", Some(proc))?;
-                    let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), Some(module()), 0)?;
-                    let keyboard = match SetWindowsHookExW(
-                        WH_KEYBOARD_LL,
-                        Some(keyboard),
-                        Some(module()),
-                        0,
-                    ) {
-                        Ok(k) => k,
+                    let (mouse, keyboard) = match install_hooks() {
+                        Ok(hooks) => hooks,
                         Err(e) => {
-                            let _ = UnhookWindowsHookEx(mouse);
                             drag.stop();
                             injector.stop();
-                            return Err(e.into());
+                            return Err(e);
                         }
                     };
                     let mut engine = Engine::new(true, cursor());
@@ -110,6 +151,18 @@ impl InputThread {
                             }) < 0
                         }),
                     );
+                    DESKTOP_WINDOW.with(|w| w.set(window.0 as isize));
+                    let desktop_hook = SetWinEventHook(
+                        EVENT_SYSTEM_DESKTOPSWITCH,
+                        EVENT_SYSTEM_DESKTOPSWITCH,
+                        None,
+                        Some(desktop_event),
+                        0,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    );
+                    let desktop_available = desktop::available();
+                    injector.desktop_available(desktop_available);
                     STATE.with(|s| {
                         *s.borrow_mut() = Some(State {
                             engine,
@@ -122,6 +175,9 @@ impl InputThread {
                             mouse,
                             keyboard,
                             window,
+                            desktop_hook,
+                            desktop_available,
+                            desktop_check: now() + 1000,
                         })
                     });
                     SetTimer(Some(window), 1, 100, None);
@@ -193,7 +249,30 @@ impl InputThread {
         self.sta.post(move || {
             with(|s| {
                 if s.peer.as_ref().is_some_and(|p| p.id == id) {
-                    s.engine.control(c, now())
+                    if matches!(
+                        c,
+                        Control::Begin { .. }
+                            | Control::DragStart { .. }
+                            | Control::DragHome { .. }
+                    ) {
+                        s.check_desktop(false);
+                    }
+                    if !s.desktop_available {
+                        if let Some(peer) = &s.peer {
+                            match c {
+                                Control::Begin { lease, .. } => {
+                                    peer.send(Control::End { lease });
+                                }
+                                Control::DragStart { offer, .. }
+                                | Control::DragHome { offer, .. } => {
+                                    peer.send(Control::DragCancel { offer });
+                                }
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
+                    s.engine.control(c, now());
                 }
             })
         });
@@ -202,7 +281,11 @@ impl InputThread {
         self.sta.post(move || {
             with(|s| {
                 if s.peer.as_ref().is_some_and(|p| p.id == id) {
-                    s.engine.receive_offer(offer, now())
+                    if s.desktop_available {
+                        s.engine.receive_offer(offer, now());
+                    } else if let Some(peer) = &s.peer {
+                        peer.send(Control::DragCancel { offer: offer.id });
+                    }
                 }
             })
         });
@@ -225,6 +308,8 @@ impl InputThread {
                     unsafe {
                         let _ = UnhookWindowsHookEx(s.mouse);
                         let _ = UnhookWindowsHookEx(s.keyboard);
+                        let _ = UnhookWinEvent(s.desktop_hook);
+                        DESKTOP_WINDOW.with(|w| w.set(0));
                         let _ = DestroyWindow(s.window);
                     }
                     s.drag.stop();
@@ -247,6 +332,37 @@ fn with(action: impl FnOnce(&mut State)) {
     });
 }
 impl State {
+    fn check_desktop(&mut self, notification: bool) {
+        let mut available = desktop::available();
+        self.desktop_check = now() + if available { 1000 } else { 500 };
+        if available == self.desktop_available && !notification {
+            return;
+        }
+        if available {
+            match install_hooks() {
+                Ok((mouse, keyboard)) => unsafe {
+                    let _ = UnhookWindowsHookEx(self.mouse);
+                    let _ = UnhookWindowsHookEx(self.keyboard);
+                    self.mouse = mouse;
+                    self.keyboard = keyboard;
+                },
+                Err(_) => {
+                    available = false;
+                    (self.notice)("Les entrées Windows sont indisponibles ; nouvelle tentative au retour sur le bureau.".into());
+                }
+            }
+        }
+        self.desktop_available = available;
+        // Do this before the engine's reset/barriers so no pending completion is
+        // removed after the engine has generated its new cleanup generation.
+        self.injector.desktop_available(available);
+        self.engine.hardware(cursor(), now());
+        storage::log(if available {
+            "desktop.resumed_inputs_reset"
+        } else {
+            "desktop.unavailable_control_cancelled"
+        });
+    }
     fn apply(&mut self) {
         for effect in self.engine.effects() {
             match effect {
@@ -291,7 +407,18 @@ impl State {
 unsafe extern "system" fn proc(w: HWND, m: u32, p: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         if m == WM_TIMER {
-            with(|s| s.engine.poll(now()));
+            with(|s| {
+                if now() >= s.desktop_check
+                    && (!s.desktop_available || s.engine.receiving() || !s.engine.outgoing.is_nil())
+                {
+                    s.check_desktop(false);
+                }
+                s.engine.poll(now());
+            });
+            return LRESULT(0);
+        }
+        if m == DESKTOP_CHANGED {
+            with(|s| s.check_desktop(true));
             return LRESULT(0);
         }
         DefWindowProcW(w, m, p, l)
@@ -337,7 +464,11 @@ unsafe extern "system" fn mouse(code: i32, message: WPARAM, data: LPARAM) -> LRE
         };
         let mut consumed = false;
         if let Some(input) = input {
-            with(|s| consumed = s.engine.physical(input, now()));
+            with(|s| {
+                if s.desktop_available {
+                    consumed = s.engine.physical(input, now());
+                }
+            });
         }
         if consumed {
             LRESULT(1)
@@ -357,6 +488,9 @@ unsafe extern "system" fn keyboard(code: i32, message: WPARAM, data: LPARAM) -> 
         }
         let mut consumed = false;
         with(|s| {
+            if !s.desktop_available {
+                return;
+            }
             consumed = s.engine.physical(
                 Input::Key {
                     key: e.vkCode as u16,

@@ -5,7 +5,10 @@ use multimachine_rust::{engine::Barrier, model::*};
 use parking_lot::{Condvar, Mutex};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -26,6 +29,7 @@ struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
     join: Mutex<Option<thread::JoinHandle<()>>>,
+    desktop_available: AtomicBool,
 }
 impl Injector {
     pub fn new(done: Arc<dyn Fn(u64, Barrier) + Send + Sync>, error: Notice) -> Self {
@@ -36,6 +40,7 @@ impl Injector {
             }),
             ready: Condvar::new(),
             join: Mutex::new(None),
+            desktop_available: AtomicBool::new(true),
         });
         let shared = s.clone();
         let worker = thread::Builder::new()
@@ -55,6 +60,9 @@ impl Injector {
                     };
                     match item {
                         Item::Input(input) => {
+                            if !shared.desktop_available.load(Ordering::Acquire) {
+                                continue;
+                            }
                             if !send(&input) {
                                 error(
                                     "Windows a refusé une entrée. Le contrôle est arrêté.".into(),
@@ -71,13 +79,28 @@ impl Injector {
                             }
                         }
                         Item::Barrier(epoch, kind) => done(epoch, kind),
-                        Item::Reset => release(&mut held),
+                        Item::Reset => {
+                            if shared.desktop_available.load(Ordering::Acquire) {
+                                release(&mut held);
+                            }
+                        }
                         Item::SourceUp => {
-                            held.remove(&1);
-                            let _ = send(&Input::Button {
-                                button: 1,
-                                up: true,
-                            });
+                            let released = shared.desktop_available.load(Ordering::Acquire)
+                                && send(&Input::Button {
+                                    button: 1,
+                                    up: true,
+                                });
+                            if released {
+                                held.remove(&1);
+                            } else {
+                                held.insert(
+                                    1,
+                                    Input::Button {
+                                        button: 1,
+                                        up: false,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -121,6 +144,10 @@ impl Injector {
         q.items.push_back(Item::Reset);
         self.0.ready.notify_one();
     }
+    pub fn desktop_available(&self, available: bool) {
+        self.0.desktop_available.store(available, Ordering::Release);
+        self.reset();
+    }
     pub fn source_up(&self) {
         let mut q = self.0.queue.lock();
         q.items.push_back(Item::SourceUp);
@@ -144,11 +171,9 @@ fn key(input: &Input) -> Option<(u16, bool)> {
     }
 }
 fn release(held: &mut HashMap<u16, Input>) {
-    for (_, input) in held.drain() {
-        if let Some(up) = input.release() {
-            let _ = send(&up);
-        }
-    }
+    // An UP refused during a desktop switch is still owed. Retain it for the
+    // reset performed on return, instead of losing the evidence of our DOWN.
+    held.retain(|_, input| input.release().is_some_and(|up| !send(&up)));
 }
 fn send(input: &Input) -> bool {
     unsafe {
@@ -243,6 +268,64 @@ fn send(input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_desktop_discards_inputs_and_releases_previous_down_on_resume() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let i = Injector::new(
+            Arc::new(move |epoch, _| {
+                let _ = tx.send(epoch);
+            }),
+            Arc::new(|_| {}),
+        );
+        let flush = |epoch| {
+            i.barrier(epoch, Barrier::Begin(uuid::Uuid::new_v4()));
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                epoch
+            );
+        };
+        i.input(Input::Button {
+            button: 1,
+            up: false,
+        });
+        flush(1);
+        assert!(unsafe { GetAsyncKeyState(1) } < 0);
+        i.desktop_available(false);
+        i.input(Input::Button {
+            button: 1,
+            up: true,
+        });
+        i.input(Input::Button {
+            button: 2,
+            up: false,
+        });
+        flush(2);
+        assert!(
+            unsafe { GetAsyncKeyState(1) } < 0,
+            "owed release must survive interruption"
+        );
+        assert!(
+            unsafe { GetAsyncKeyState(2) } >= 0,
+            "new input must be discarded"
+        );
+        i.desktop_available(true);
+        flush(3);
+        assert!(
+            unsafe { GetAsyncKeyState(1) } >= 0,
+            "resume must release prior DOWN"
+        );
+        i.input(Input::Button {
+            button: 1,
+            up: false,
+        });
+        flush(4);
+        assert!(
+            unsafe { GetAsyncKeyState(1) } < 0,
+            "new control works without relaunch"
+        );
+        i.stop();
+        assert!(unsafe { GetAsyncKeyState(1) } >= 0);
+    }
     #[test]
     fn reset_and_shutdown_balance_native_button_down() {
         let (tx, rx) = std::sync::mpsc::channel();

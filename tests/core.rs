@@ -631,3 +631,54 @@ fn simultaneous_claims_have_one_winner() {
     assert!(rig.pc[1].receiving());
     assert!(!rig.pc[1].granted);
 }
+
+#[test]
+fn desktop_interruption_ends_both_leases_and_allows_fresh_control_in_either_role() {
+    for right in [false, true] {
+        for physical in 0..2 {
+            for interrupted in 0..2 {
+                let mut rig = Rig::new(right);
+                let begin = |rig: &mut Rig| {
+                    let l = rig.pc[physical].layout.as_ref().unwrap();
+                    let exit = Point::new(if l.placement.right { 99 } else { 0 }, 50);
+                    let target = l.exit(exit, l.direction()).unwrap();
+                    assert!(rig.pc[physical].begin(exit, target, None, rig.time));
+                    rig.pump();
+                    assert!(rig.pc[physical].granted);
+                };
+                begin(&mut rig);
+                let old = rig.pc[physical].outgoing;
+                rig.physical(physical, left(false));
+                rig.pc[interrupted].hardware(Point::new(50, 50), rig.time);
+                rig.pump();
+                assert!(
+                    rig.pc
+                        .iter()
+                        .all(|p| p.incoming.is_nil() && p.outgoing.is_nil())
+                );
+                rig.pc[interrupted].hardware(Point::new(50, 50), rig.time + 100);
+                rig.pump();
+                rig.physical(physical, left(true));
+                begin(&mut rig);
+                assert_ne!(old, rig.pc[physical].outgoing);
+                rig.pc[1 - physical].control(
+                    Control::Input {
+                        lease: old,
+                        input: left(false),
+                    },
+                    rig.time,
+                );
+                assert!(
+                    !rig.pc[1 - physical]
+                        .effects()
+                        .iter()
+                        .any(|e| matches!(e, Effect::Inject(_)))
+                );
+                rig.physical(physical, left(false));
+                assert!(rig.pc[1 - physical].left());
+                rig.physical(physical, left(true));
+                assert!(!rig.pc[1 - physical].left());
+            }
+        }
+    }
+}

@@ -203,6 +203,56 @@ async fn tls_pairing_udp_tcp_bulk_and_reconnect() {
     }
     assert!(client.stats().1 > 0);
     assert!(client.stats().2 > 0);
+    client.send(Control::Input {
+        lease,
+        input: Input::Button {
+            button: 1,
+            up: true,
+        },
+    });
+    assert!(matches!(
+        control(&mut server_events).await,
+        Control::Input {
+            input: Input::Button { up: true, .. },
+            ..
+        }
+    ));
+    // Observe actual control frames AND UDP probes, not only motion counters.
+    // Keeping the session connected must not keep 100 ms/1 s timers transmitting.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(!client.active() && !remote.active());
+    assert_eq!(client.transport(), "Hybride au repos");
+    let before = (client.sent_packets(), remote.sent_packets());
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(before, (client.sent_packets(), remote.sent_packets()));
+    assert!(client.connected() && remote.connected());
+    // A resumed operation is delivered immediately over TCP while UDP reopens.
+    client.send(Control::Input {
+        lease,
+        input: Input::Move {
+            position: Point::new(1001, 51),
+        },
+    });
+    let resumed = timeout(Duration::from_secs(1), control(&mut server_events))
+        .await
+        .unwrap();
+    assert!(matches!(
+        resumed,
+        Control::Input {
+            input: Input::Move {
+                position: Point { x: 1001, y: 51 }
+            },
+            ..
+        }
+    ));
+    for _ in 0..30 {
+        if client.transport() == "Hybride actif" && remote.transport() == "Hybride actif" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(client.transport(), "Hybride actif");
+    assert_eq!(remote.transport(), "Hybride actif");
     let temp = std::env::temp_dir().join(format!("mmr-net-{}", Uuid::new_v4()));
     fs::create_dir(&temp).unwrap();
     let file = temp.join("transfer.bin");

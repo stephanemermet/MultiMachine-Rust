@@ -26,6 +26,9 @@ pub(super) struct MotionPath {
     pub stop: CancellationToken,
     pub sent: AtomicU64,
     pub accepted: AtomicU64,
+    pub packets: AtomicU64,
+    activity: AtomicU64,
+    wake: Notify,
 }
 fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
@@ -60,6 +63,9 @@ impl MotionPath {
             stop: CancellationToken::new(),
             sent: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
+            packets: AtomicU64::new(0),
+            activity: AtomicU64::new(now()),
+            wake: Notify::new(),
         })
     }
     pub async fn server(
@@ -94,6 +100,13 @@ impl MotionPath {
         self.stop.cancel();
         self.socket.lock().take();
     }
+    pub fn touch(&self) {
+        let tick = now();
+        let previous = self.activity.swap(tick, Ordering::Relaxed);
+        if tick.saturating_sub(previous) >= health::ACTIVE_GRACE_MS {
+            self.wake.notify_one();
+        }
+    }
     pub fn ready(&self) -> bool {
         let ack = self.ack.load(Ordering::Relaxed);
         !self.stop.is_cancelled() && ack > 0 && now().saturating_sub(ack) < 350
@@ -115,6 +128,8 @@ impl MotionPath {
         let result = tokio::select! {r=socket.send_to(&bytes,target)=>r.is_ok(),_=self.stop.cancelled()=>false};
         if !result {
             self.ack.store(0, Ordering::Relaxed)
+        } else {
+            self.packets.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -134,11 +149,40 @@ impl MotionPath {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(100));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last = 0;
             loop {
-                tokio::select! {_=this.stop.cancelled()=>break,_=timer.tick()=>{let tick=now();if last==0||this.ready()||tick.saturating_sub(last)>=1000{last=tick;let sequence=this.probe.fetch_add(1,Ordering::Relaxed)+1;this.send(1,&Motion{lease:Uuid::nil(),sequence,after:tick,position:Point::default()}).await;}}}
+                let tick = now();
+                let active_until = this
+                    .activity
+                    .load(Ordering::Relaxed)
+                    .saturating_add(health::ACTIVE_GRACE_MS);
+                if tick >= active_until {
+                    tokio::select! { _=this.stop.cancelled()=>break, _=this.wake.notified()=>{} }
+                    // Probe immediately on renewed use, even if the previous path expired.
+                    last = 0;
+                    continue;
+                }
+                let interval = if this.ready() { 100 } else { 1000 };
+                if last == 0 || tick.saturating_sub(last) >= interval {
+                    last = tick;
+                    let sequence = this.probe.fetch_add(1, Ordering::Relaxed) + 1;
+                    this.send(
+                        1,
+                        &Motion {
+                            lease: Uuid::nil(),
+                            sequence,
+                            after: tick,
+                            position: Point::default(),
+                        },
+                    )
+                    .await;
+                }
+                let deadline = active_until.min(last.saturating_add(interval));
+                tokio::select! {
+                    _=this.stop.cancelled()=>break,
+                    _=this.wake.notified()=>{},
+                    _=tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(now())))=>{}
+                }
             }
         });
         let this = self.clone();
@@ -183,6 +227,7 @@ impl MotionPath {
                         {
                             this.acked.store(frame.sequence, Ordering::Relaxed);
                             this.ack.store(n, Ordering::Relaxed);
+                            this.wake.notify_one();
                         }
                     }
                     3 => {

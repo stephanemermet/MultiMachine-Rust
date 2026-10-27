@@ -1,6 +1,7 @@
 mod capture;
 mod clipboard;
 mod data;
+mod desktop;
 mod display;
 mod drag;
 mod injector;

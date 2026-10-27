@@ -31,7 +31,7 @@ use windows::{
         Foundation::*,
         Graphics::Gdi::*,
         System::{Ole::*, RemoteDesktop::*, Threading::*},
-        UI::{HiDpi::*, Shell::*, WindowsAndMessaging::*},
+        UI::{Controls::SetScrollInfo, HiDpi::*, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
 };
@@ -80,9 +80,12 @@ struct App {
     identity: Identity,
     trust: Option<Trust>,
     controls: std::collections::HashMap<usize, HWND>,
-    widgets: Vec<(HWND, i32, i32, i32, i32)>,
+    widgets: Vec<(usize, HWND)>,
     fonts: Vec<HFONT>,
-    icon: HICON,
+    icons: Icons,
+    dpi: u32,
+    scroll: i32,
+    content_height: i32,
     tray: bool,
     notice: String,
     topology_ticks: u32,
@@ -106,7 +109,82 @@ const STATUS: usize = 30;
 const TRANSPORT: usize = 31;
 const HIDE: usize = 32;
 const LOGS: usize = 33;
+const TITLE: usize = 40;
+const SUBTITLE: usize = 41;
+const ROLE_LABEL: usize = 42;
+const HOST_LABEL: usize = 43;
+const PORT_LABEL: usize = 44;
+const SHORTCUT: usize = 45;
 const TRAY_MESSAGE: u32 = WM_APP + 2;
+const REDRAW_STATUS: u32 = WM_APP + 3;
+const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
+const MAIN_STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+const MAIN_EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
+
+struct Icons {
+    small: HICON,
+    large: HICON,
+}
+impl Icons {
+    fn load(dpi: u32) -> Result<Self> {
+        unsafe {
+            let load = |x, y| {
+                LoadImageW(
+                    Some(module()),
+                    w!("MMR_ICON"),
+                    IMAGE_ICON,
+                    GetSystemMetricsForDpi(x, dpi),
+                    GetSystemMetricsForDpi(y, dpi),
+                    LR_DEFAULTCOLOR,
+                )
+                .map(|h| HICON(h.0))
+            };
+            let small = load(SM_CXSMICON, SM_CYSMICON)?;
+            match load(SM_CXICON, SM_CYICON) {
+                Ok(large) => Ok(Self { small, large }),
+                Err(error) => {
+                    let _ = DestroyIcon(small);
+                    Err(error.into())
+                }
+            }
+        }
+    }
+    fn apply(&self, window: HWND) {
+        unsafe {
+            SendMessageW(
+                window,
+                WM_SETICON,
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(self.large.0 as isize)),
+            );
+            SendMessageW(
+                window,
+                WM_SETICON,
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(self.small.0 as isize)),
+            );
+        }
+    }
+}
+impl Drop for Icons {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyIcon(self.small);
+            let _ = DestroyIcon(self.large);
+        }
+    }
+}
+fn outer_size(width: i32, height: i32, dpi: u32) -> (i32, i32) {
+    let mut r = RECT {
+        right: width,
+        bottom: height,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(&mut r, MAIN_STYLE, false, MAIN_EX_STYLE, dpi);
+    }
+    (r.right - r.left, r.bottom - r.top)
+}
 
 pub fn run() -> Result<()> {
     unsafe {
@@ -126,19 +204,20 @@ pub fn run() -> Result<()> {
             hInstance: module(),
             lpszClassName: w!("MultiMachineRust.Main"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: LoadIconW(Some(module()), w!("MMR_ICON"))?,
             hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
             ..Default::default()
         };
         RegisterClassW(&wc);
         let window = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            MAIN_EX_STYLE,
             w!("MultiMachineRust.Main"),
             w!("MultiMachine Rust"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            MAIN_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            690 * GetDpiForSystem() as i32 / 96,
-            530 * GetDpiForSystem() as i32 / 96,
+            700,
+            600,
             None,
             None,
             Some(module()),
@@ -172,28 +251,8 @@ pub fn run() -> Result<()> {
         let settings = storage::settings()?;
         let identity = storage::identity()?;
         let trust = storage::trust()?;
-        let icon = LoadImageW(
-            Some(module()),
-            PCWSTR(std::ptr::dangling::<u16>()),
-            IMAGE_ICON,
-            32,
-            32,
-            LR_DEFAULTCOLOR,
-        )
-        .map(|h| HICON(h.0))
-        .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default());
-        SendMessageW(
-            window,
-            WM_SETICON,
-            Some(WPARAM(ICON_BIG as usize)),
-            Some(LPARAM(icon.0 as isize)),
-        );
-        SendMessageW(
-            window,
-            WM_SETICON,
-            Some(WPARAM(ICON_SMALL as usize)),
-            Some(LPARAM(icon.0 as isize)),
-        );
+        let dpi = GetDpiForWindow(window).max(96);
+        let icons = Icons::load(dpi)?;
         let mut app = App {
             window,
             ui,
@@ -216,7 +275,10 @@ pub fn run() -> Result<()> {
             controls: Default::default(),
             widgets: vec![],
             fonts: vec![],
-            icon,
+            icons,
+            dpi,
+            scroll: 0,
+            content_height: 0,
             tray: false,
             notice: "Prêt. Choisissez le rôle de cette machine.".into(),
             topology_ticks: 0,
@@ -225,12 +287,13 @@ pub fn run() -> Result<()> {
         app.create_controls();
         app.rescale();
         app.fill();
+        app.fit_window();
         app.tray(true);
         let auto = app.settings.auto_connect;
         let minimized = app.settings.minimized || std::env::args().any(|s| s == "--startup");
         APP.with(|a| *a.borrow_mut() = Some(app));
         let _ = WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION);
-        SetTimer(Some(window), 1, 500, None);
+        SetTimer(Some(window), 1, 2000, None);
         if !minimized || !app_tray_available() {
             let _ = ShowWindow(window, SW_SHOW);
         }
@@ -240,8 +303,10 @@ pub fn run() -> Result<()> {
         storage::log("application.start");
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if !IsDialogMessageW(window, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
         APP.with(|a| {
             a.borrow_mut().take();
@@ -291,16 +356,50 @@ unsafe extern "system" fn proc(w: HWND, m: u32, p: WPARAM, l: LPARAM) -> LRESULT
                 return LRESULT(0);
             }
             WM_CLOSE => {
-                with(|a| {
-                    if !a.tray {
-                        a.tray(true)
-                    }
-                    let _ = ShowWindow(w, SW_HIDE);
-                });
+                with(|a| a.hide());
                 return LRESULT(0);
             }
             WM_SIZE if p.0 == SIZE_MINIMIZED as usize => {
-                let _ = ShowWindow(w, SW_HIDE);
+                with(|a| {
+                    if a.tray {
+                        let _ = ShowWindow(w, SW_HIDE);
+                    }
+                });
+                return LRESULT(0);
+            }
+            WM_SIZE => {
+                with(|a| a.layout());
+                return LRESULT(0);
+            }
+            WM_GETMINMAXINFO => {
+                let dpi = GetDpiForWindow(w).max(96);
+                let (width, height) = outer_size(360 * dpi as i32 / 96, 240 * dpi as i32 / 96, dpi);
+                let limits = &mut *(l.0 as *mut MINMAXINFO);
+                limits.ptMinTrackSize = POINT {
+                    x: width,
+                    y: height,
+                };
+                return LRESULT(0);
+            }
+            WM_VSCROLL => {
+                with(|a| a.scroll(p.0 as u32 & 0xffff));
+                return LRESULT(0);
+            }
+            WM_MOUSEWHEEL => {
+                with(|a| {
+                    a.scroll -= ((p.0 >> 16) as i16 as i32) * 48 * a.dpi as i32 / (120 * 96);
+                    a.layout();
+                });
+                return LRESULT(0);
+            }
+            WM_SHOWWINDOW if p.0 != 0 => {
+                let _ = PostMessageW(Some(w), REDRAW_STATUS, WPARAM(0), LPARAM(0));
+            }
+            REDRAW_STATUS => {
+                with(|a| {
+                    a.render_status();
+                    a.layout();
+                });
                 return LRESULT(0);
             }
             WM_DISPLAYCHANGE | WM_DEVICECHANGE => {
@@ -336,8 +435,9 @@ unsafe extern "system" fn proc(w: HWND, m: u32, p: WPARAM, l: LPARAM) -> LRESULT
                 return LRESULT(1);
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                SetBkColor(HDC(p.0 as *mut _), COLORREF(0xffffff));
-                return LRESULT(GetStockObject(WHITE_BRUSH).0 as isize);
+                SetBkColor(HDC(p.0 as *mut _), COLORREF(GetSysColor(COLOR_WINDOW)));
+                SetTextColor(HDC(p.0 as *mut _), COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+                return LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize);
             }
             WM_ENDSESSION if p.0 != 0 => {
                 with(|a| a.quit());
@@ -357,13 +457,16 @@ unsafe extern "system" fn proc(w: HWND, m: u32, p: WPARAM, l: LPARAM) -> LRESULT
                 with(|a| a.rescale());
                 return LRESULT(0);
             }
+            WM_THEMECHANGED | WM_SETTINGCHANGE => {
+                with(|a| a.rescale());
+            }
             TRAY_MESSAGE => {
-                with(|a| match l.0 as u32 {
-                    WM_LBUTTONDBLCLK | WM_LBUTTONUP => {
+                with(|a| match l.0 as u32 & 0xffff {
+                    WM_LBUTTONDBLCLK | WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT => {
                         let _ = ShowWindow(w, SW_RESTORE);
                         let _ = SetForegroundWindow(w);
                     }
-                    WM_RBUTTONUP => a.menu(),
+                    WM_RBUTTONUP | WM_CONTEXTMENU => a.menu(),
                     _ => (),
                 });
                 return LRESULT(0);
@@ -389,53 +492,32 @@ unsafe extern "system" fn proc(w: HWND, m: u32, p: WPARAM, l: LPARAM) -> LRESULT
 impl App {
     fn rescale(&mut self) {
         unsafe {
-            let dpi = GetDpiForWindow(self.window) as i32;
-            let body = CreateFontW(
-                -15 * dpi / 96,
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                0,
-                w!("Segoe UI"),
-            );
-            let title = CreateFontW(
-                -22 * dpi / 96,
-                0,
-                0,
-                0,
-                600,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                0,
-                w!("Segoe UI"),
-            );
-            for (i, (child, x, y, w, h)) in self.widgets.iter().enumerate() {
-                let _ = SetWindowPos(
-                    *child,
-                    None,
-                    x * dpi / 96,
-                    y * dpi / 96,
-                    w * dpi / 96,
-                    h * dpi / 96,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+            let dpi = GetDpiForWindow(self.window).max(96);
+            let font = |height: i32, weight| {
+                CreateFontW(
+                    -height * dpi as i32 / 96,
+                    0,
+                    0,
+                    0,
+                    weight,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    0,
+                    w!("Segoe UI"),
+                )
+            };
+            let body = font(15, 400);
+            let title = font(22, 600);
+            for (id, child) in &self.widgets {
                 SendMessageW(
                     *child,
                     WM_SETFONT,
-                    Some(WPARAM(if i == 0 { title.0 } else { body.0 } as usize)),
+                    Some(WPARAM(if *id == TITLE { title.0 } else { body.0 } as usize)),
                     Some(LPARAM(1)),
                 );
             }
@@ -443,199 +525,323 @@ impl App {
                 let _ = DeleteObject(font.into());
             }
             self.fonts = vec![body, title];
+            if self.dpi != dpi {
+                if let Ok(icons) = Icons::load(dpi) {
+                    icons.apply(self.window);
+                    self.icons = icons;
+                    if self.tray {
+                        self.tray(true);
+                    }
+                }
+            } else {
+                self.icons.apply(self.window);
+            }
+            self.dpi = dpi;
+            self.layout();
+        }
+    }
+    fn fit_window(&mut self) {
+        unsafe {
+            // Size the client area with this window's actual monitor DPI. System
+            // DPI can differ on the first launch on a secondary monitor.
+            let mut monitor = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(
+                MonitorFromWindow(self.window, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            )
+            .as_bool()
+            {
+                return;
+            }
+            let work = monitor.rcWork;
+            let mut previous = RECT::default();
+            let _ = GetWindowRect(self.window, &mut previous);
+            let scale = self.dpi as i32;
+            let (width, height) = outer_size(680 * scale / 96, 580 * scale / 96, self.dpi);
+            let width = width.min(work.right - work.left);
+            let height = height.min(work.bottom - work.top);
+            let x = previous.left.clamp(work.left, work.right - width);
+            let y = previous.top.clamp(work.top, work.bottom - height);
+            let _ = SetWindowPos(
+                self.window,
+                None,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            self.layout();
+            let (_, fitted) = outer_size(0, self.content_height, self.dpi);
+            let height = fitted.min(work.bottom - y);
+            let _ = SetWindowPos(
+                self.window,
+                None,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            self.layout();
+        }
+    }
+    fn layout(&mut self) {
+        if self.fonts.is_empty() {
+            return;
+        }
+        unsafe {
+            let s = |n: i32| (n * self.dpi as i32 + 48) / 96;
+            let dc = GetDC(Some(self.window));
+            let previous_font = SelectObject(dc, self.fonts[0].into());
+            let measured = |id: usize, width: i32| {
+                let mut chars = wide(&text(self.controls[&id]));
+                chars.pop();
+                let mut r = RECT {
+                    right: width.max(1),
+                    ..Default::default()
+                };
+                DrawTextW(
+                    dc,
+                    &mut chars,
+                    &mut r,
+                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                );
+                (r.right, r.bottom)
+            };
+            // Showing or hiding the vertical scrollbar can change client width.
+            // Recompute before placing children, including after a DPI change.
+            for _ in 0..3 {
+                let mut client = RECT::default();
+                let _ = GetClientRect(self.window, &mut client);
+                let margin = s(20);
+                let gap = s(12);
+                let width = (client.right - 2 * margin).max(s(100));
+                let wide_form = width >= s(600);
+                let row = s(32);
+                let mut positions = Vec::new();
+                let mut place = |id, x, y, w, h| positions.push((id, x, y, w, h));
+                let mut y = s(16);
+                place(TITLE, margin, y, width, s(30));
+                y += s(34);
+                place(SUBTITLE, margin, y, width, s(24));
+                y += s(38);
+                let label = s(150);
+                if wide_form {
+                    place(ROLE_LABEL, margin, y + s(4), label, row);
+                    place(ROLE, margin + label, y, width - label, s(150));
+                    y += row + s(10);
+                    place(HOST_LABEL, margin, y + s(4), label, row);
+                    place(HOST, margin + label, y, width - label - s(125) - gap, row);
+                    place(DISCOVER, margin + width - s(125), y, s(125), row);
+                    y += row + s(10);
+                    place(PORT_LABEL, margin, y + s(4), label, row);
+                    place(PORTID, margin + label, y, s(90), row);
+                    let left = margin + label + s(90) + gap;
+                    let button = (margin + width - left - gap) / 2;
+                    place(START, left, y, button, row);
+                    place(SCREENS, left + button + gap, y, button, row);
+                    y += row + s(20);
+                } else {
+                    place(ROLE_LABEL, margin, y, width, s(24));
+                    y += s(25);
+                    place(ROLE, margin, y, width, s(150));
+                    y += row + s(10);
+                    place(HOST_LABEL, margin, y, width, s(24));
+                    y += s(25);
+                    place(HOST, margin, y, width - s(105) - gap, row);
+                    place(DISCOVER, margin + width - s(105), y, s(105), row);
+                    y += row + s(10);
+                    place(PORT_LABEL, margin, y + s(4), label, row);
+                    place(PORTID, margin + label, y, (width - label).min(s(110)), row);
+                    y += row + gap;
+                    let button = (width - gap) / 2;
+                    place(START, margin, y, button, row);
+                    place(SCREENS, margin + button + gap, y, button, row);
+                    y += row + s(20);
+                }
+                let pairs = [(HYBRID, TRAILS), (PLAIN, AUTO), (AUTOSTART, MINIMIZED)];
+                let column = (width - gap) / 2;
+                let two_columns = pairs.iter().all(|(a, b)| {
+                    [a, b]
+                        .iter()
+                        .all(|id| measured(**id, 100_000).0 + s(30) <= column)
+                });
+                for (a, b) in pairs {
+                    if two_columns {
+                        place(a, margin, y, column, s(28));
+                        place(b, margin + column + gap, y, column, s(28));
+                        y += s(33);
+                    } else {
+                        for id in [a, b] {
+                            let height = (measured(id, width - s(30)).1 + s(8)).max(s(28));
+                            place(id, margin, y, width, height);
+                            y += height + s(5);
+                        }
+                    }
+                }
+                y += s(12);
+                let buttons = [PAIR, LOGS, HIDE];
+                let thirds = (width - 2 * gap) / 3;
+                if buttons
+                    .iter()
+                    .all(|id| measured(*id, 100_000).0 + s(22) <= thirds)
+                {
+                    for (i, id) in buttons.into_iter().enumerate() {
+                        place(id, margin + i as i32 * (thirds + gap), y, thirds, row);
+                    }
+                    y += row + s(18);
+                } else {
+                    for id in buttons {
+                        place(id, margin, y, width, row);
+                        y += row + s(8);
+                    }
+                    y += s(10);
+                }
+                let height = (measured(STATUS, width).1 + s(6)).max(s(48));
+                place(STATUS, margin, y, width, height);
+                y += height + s(10);
+                place(TRANSPORT, margin, y, width, s(44));
+                y += s(48);
+                let height = (measured(SHORTCUT, width).1 + s(6)).max(s(24));
+                place(SHORTCUT, margin, y, width, height);
+                y += height + margin;
+                self.content_height = y;
+                self.scroll = self.scroll.clamp(0, (y - client.bottom).max(0));
+                let info = SCROLLINFO {
+                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                    nMin: 0,
+                    nMax: y - 1,
+                    nPage: client.bottom.max(0) as u32,
+                    nPos: self.scroll,
+                    ..Default::default()
+                };
+                SetScrollInfo(self.window, SB_VERT, &info, true);
+                let mut after = RECT::default();
+                let _ = GetClientRect(self.window, &mut after);
+                if after.right != client.right {
+                    continue;
+                }
+                for (id, x, y, w, h) in positions {
+                    let _ = SetWindowPos(
+                        self.controls[&id],
+                        None,
+                        x,
+                        y - self.scroll,
+                        w,
+                        h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                break;
+            }
+            SelectObject(dc, previous_font);
+            ReleaseDC(Some(self.window), dc);
+            let _ = InvalidateRect(Some(self.window), None, true);
+        }
+    }
+    fn scroll(&mut self, command: u32) {
+        unsafe {
+            let mut client = RECT::default();
+            let _ = GetClientRect(self.window, &mut client);
+            let line = 32 * self.dpi as i32 / 96;
+            match command {
+                n if n == SB_LINEUP.0 as u32 => self.scroll -= line,
+                n if n == SB_LINEDOWN.0 as u32 => self.scroll += line,
+                n if n == SB_PAGEUP.0 as u32 => self.scroll -= client.bottom - line,
+                n if n == SB_PAGEDOWN.0 as u32 => self.scroll += client.bottom - line,
+                n if n == SB_TOP.0 as u32 => self.scroll = 0,
+                n if n == SB_BOTTOM.0 as u32 => self.scroll = self.content_height,
+                n if n == SB_THUMBTRACK.0 as u32 || n == SB_THUMBPOSITION.0 as u32 => {
+                    let mut info = SCROLLINFO {
+                        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                        fMask: SIF_TRACKPOS,
+                        ..Default::default()
+                    };
+                    if GetScrollInfo(self.window, SB_VERT, &mut info).is_ok() {
+                        self.scroll = info.nTrackPos;
+                    }
+                }
+                _ => return,
+            }
+            self.layout();
         }
     }
     fn create_controls(&mut self) {
         unsafe {
             let specs = [
-                ("STATIC", "MultiMachine Rust", 0, 22, 16, 620, 28, 0),
-                (
-                    "STATIC",
-                    "Deux PC, un espace de travail",
-                    0,
-                    22,
-                    47,
-                    620,
-                    24,
-                    0,
-                ),
-                ("STATIC", "Cette machine", 0, 22, 88, 150, 24, 0),
-                (
-                    "COMBOBOX",
-                    "",
-                    CBS_DROPDOWNLIST as u32,
-                    175,
-                    83,
-                    450,
-                    100,
-                    ROLE,
-                ),
-                ("STATIC", "Adresse du serveur", 0, 22, 130, 150, 24, 0),
-                (
-                    "EDIT",
-                    "",
-                    WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-                    175,
-                    125,
-                    310,
-                    28,
-                    HOST,
-                ),
-                (
-                    "BUTTON",
-                    "Détecter",
-                    BS_PUSHBUTTON as u32,
-                    500,
-                    124,
-                    125,
-                    30,
-                    DISCOVER,
-                ),
-                ("STATIC", "Port", 0, 22, 173, 150, 24, 0),
-                (
-                    "EDIT",
-                    "",
-                    WS_BORDER.0 | ES_NUMBER as u32,
-                    175,
-                    166,
-                    95,
-                    28,
-                    PORTID,
-                ),
-                (
-                    "BUTTON",
-                    "Démarrer",
-                    BS_DEFPUSHBUTTON as u32,
-                    290,
-                    164,
-                    150,
-                    34,
-                    START,
-                ),
-                (
-                    "BUTTON",
-                    "Écrans…",
-                    BS_PUSHBUTTON as u32,
-                    455,
-                    164,
-                    170,
-                    34,
-                    SCREENS,
-                ),
+                ("STATIC", "MultiMachine Rust", 0, TITLE),
+                ("STATIC", "Deux PC, un espace de travail", 0, SUBTITLE),
+                ("STATIC", "Cette machine", 0, ROLE_LABEL),
+                ("COMBOBOX", "", CBS_DROPDOWNLIST as u32, ROLE),
+                ("STATIC", "Adresse du serveur", 0, HOST_LABEL),
+                ("EDIT", "", WS_BORDER.0 | ES_AUTOHSCROLL as u32, HOST),
+                ("BUTTON", "Détecter", BS_PUSHBUTTON as u32, DISCOVER),
+                ("STATIC", "Port", 0, PORT_LABEL),
+                ("EDIT", "", WS_BORDER.0 | ES_NUMBER as u32, PORTID),
+                ("BUTTON", "Démarrer", BS_DEFPUSHBUTTON as u32, START),
+                ("BUTTON", "Écrans…", BS_PUSHBUTTON as u32, SCREENS),
                 (
                     "BUTTON",
                     "Mouvement hybride UDP + TCP",
-                    BS_AUTOCHECKBOX as u32,
-                    22,
-                    217,
-                    350,
-                    24,
+                    (BS_AUTOCHECKBOX | BS_MULTILINE) as u32,
                     HYBRID,
                 ),
                 (
                     "BUTTON",
                     "Traces du curseur distant",
-                    BS_AUTOCHECKBOX as u32,
-                    380,
-                    217,
-                    265,
-                    24,
+                    (BS_AUTOCHECKBOX | BS_MULTILINE) as u32,
                     TRAILS,
                 ),
                 (
                     "BUTTON",
                     "Texte sans mise en forme",
-                    BS_AUTOCHECKBOX as u32,
-                    22,
-                    250,
-                    350,
-                    24,
+                    (BS_AUTOCHECKBOX | BS_MULTILINE) as u32,
                     PLAIN,
                 ),
                 (
                     "BUTTON",
                     "Connexion automatique",
-                    BS_AUTOCHECKBOX as u32,
-                    380,
-                    250,
-                    265,
-                    24,
+                    (BS_AUTOCHECKBOX | BS_MULTILINE) as u32,
                     AUTO,
                 ),
                 (
                     "BUTTON",
                     "Démarrer avec Windows",
-                    BS_AUTOCHECKBOX as u32,
-                    22,
-                    283,
-                    350,
-                    24,
+                    (BS_AUTOCHECKBOX | BS_MULTILINE) as u32,
                     AUTOSTART,
                 ),
                 (
                     "BUTTON",
                     "Démarrer réduit",
-                    BS_AUTOCHECKBOX as u32,
-                    380,
-                    283,
-                    265,
-                    24,
+                    (BS_AUTOCHECKBOX | BS_MULTILINE) as u32,
                     MINIMIZED,
                 ),
+                ("BUTTON", "Nouvelle association", BS_PUSHBUTTON as u32, PAIR),
+                ("BUTTON", "Diagnostics", BS_PUSHBUTTON as u32, LOGS),
                 (
                     "BUTTON",
-                    "Nouvelle association",
+                    "Réduire près de l’horloge",
                     BS_PUSHBUTTON as u32,
-                    22,
-                    326,
-                    210,
-                    31,
-                    PAIR,
-                ),
-                (
-                    "BUTTON",
-                    "Diagnostics",
-                    BS_PUSHBUTTON as u32,
-                    247,
-                    326,
-                    180,
-                    31,
-                    LOGS,
-                ),
-                (
-                    "BUTTON",
-                    "Réduire dans la zone",
-                    BS_PUSHBUTTON as u32,
-                    442,
-                    326,
-                    183,
-                    31,
                     HIDE,
                 ),
-                ("STATIC", "", 0, 22, 378, 620, 48, STATUS),
+                ("STATIC", "", 0, STATUS),
+                ("STATIC", "Connexion arrêtée", 0, TRANSPORT),
                 (
                     "STATIC",
                     "Ctrl + Alt + F12 : reprendre la main",
                     0,
-                    22,
-                    442,
-                    620,
-                    24,
-                    TRANSPORT,
+                    SHORTCUT,
                 ),
             ];
-            for (class, label, style, x, y, w, h, id) in specs {
-                let c = layout_dialog::control(self.window, class, label, style, x, y, w, h, id);
-                SendMessageW(
-                    c,
-                    WM_SETFONT,
-                    Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)),
-                    Some(LPARAM(1)),
-                );
-                self.widgets.push((c, x, y, w, h));
-                if id != 0 {
-                    self.controls.insert(id, c);
-                }
+            for (class, label, style, id) in specs {
+                let c = layout_dialog::control(self.window, class, label, style, 0, 0, 1, 1, id);
+                self.widgets.push((id, c));
+                self.controls.insert(id, c);
             }
             for name in [
                 "Serveur · accepte la connexion",
@@ -700,7 +906,10 @@ impl App {
     }
     fn status(&mut self, text: &str) {
         self.notice = text.to_owned();
-        set_text(self.controls[&STATUS], text);
+        if unsafe { IsWindowVisible(self.window).as_bool() } {
+            self.render_status();
+            self.layout();
+        }
     }
     fn command(&mut self, id: usize, notification: u16) {
         match id {
@@ -711,10 +920,14 @@ impl App {
                     self.start()
                 }
             }
-            HIDE => unsafe {
-                let _ = ShowWindow(self.window, SW_HIDE);
-            },
+            HIDE => self.hide(),
             LOGS => unsafe {
+                if let Some(peer) = &self.peer {
+                    let (q, c, u, received, rtt) = peer.stats();
+                    storage::log(&format!(
+                        "diagnostics.requested queue={q} coalesced={c} udp_sent={u} udp_received={received} tcp_rtt_ms={rtt:?}"
+                    ));
+                }
                 let path = storage::root();
                 let _ = std::fs::create_dir_all(&path);
                 ShellExecuteW(
@@ -1048,30 +1261,47 @@ if result.is_err(){let ui=ui.clone();ui.post(move|a|if a.active(id){a.status("É
     }
     fn tick(&mut self) {
         self.topology_ticks += 1;
-        if self.topology_ticks % 4 == 0 {
-            self.refresh_topology();
+        self.refresh_topology();
+        if !self.tray && self.topology_ticks % 3 == 0 {
+            self.tray(true);
         }
-        if let Some(p) = &self.peer {
-            let (q, c, u, received, rtt) = p.stats();
-            set_text(
-                self.controls[&TRANSPORT],
-                &format!(
-                    "{} · délai {} ms · Ctrl + Alt + F12 pour revenir",
-                    p.transport(),
-                    rtt.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
-                ),
-            );
-            if self.topology_ticks % 20 == 0 {
-                storage::log(&format!(
-                    "transport queue={q} coalesced={c} udp_sent={u} udp_received={received} rtt_ms={}",
-                    rtt.unwrap_or(0)
-                ));
+        self.render_status();
+    }
+    fn render_status(&self) {
+        // No statistic reads, formatting, WM_SETTEXT or logging for a hidden UI.
+        if !unsafe { IsWindowVisible(self.window).as_bool() }
+            || unsafe { IsIconic(self.window).as_bool() }
+        {
+            return;
+        }
+        let changed = |id, value: &str| {
+            let window = self.controls[&id];
+            if text(window) != value {
+                set_text(window, value);
             }
-        } else {
-            set_text(
-                self.controls[&TRANSPORT],
-                "Ctrl + Alt + F12 : reprendre la main",
-            );
+        };
+        changed(STATUS, &self.notice);
+        let label = match &self.peer {
+            Some(peer) if peer.active() => {
+                let rtt = peer
+                    .stats()
+                    .4
+                    .map(|n| format!("{n} ms"))
+                    .unwrap_or_else(|| "en attente".into());
+                format!("{} · ping TCP aller-retour : {rtt}", peer.transport())
+            }
+            Some(peer) => format!("{} · surveillance espacée", peer.transport()),
+            None => "Connexion arrêtée".into(),
+        };
+        changed(TRANSPORT, &label);
+    }
+    fn hide(&mut self) {
+        if !self.tray {
+            self.tray(true);
+        }
+        unsafe {
+            // If Explorer cannot register the tray icon, retain the taskbar entry.
+            let _ = ShowWindow(self.window, if self.tray { SW_HIDE } else { SW_MINIMIZE });
         }
     }
     fn stop(&mut self) {
@@ -1130,13 +1360,19 @@ if result.is_err(){let ui=ui.clone();ui.post(move|a|if a.active(id){a.status("É
                 uID: 1,
                 uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
                 uCallbackMessage: TRAY_MESSAGE,
-                hIcon: self.icon,
+                hIcon: self.icons.small,
                 ..Default::default()
             };
             let tip = wide("MultiMachine Rust");
             data.szTip[..tip.len()].copy_from_slice(&tip);
             self.tray = if show {
-                Shell_NotifyIconW(NIM_ADD, &data).as_bool()
+                let registered = (self.tray && Shell_NotifyIconW(NIM_MODIFY, &data).as_bool())
+                    || Shell_NotifyIconW(NIM_ADD, &data).as_bool();
+                if registered {
+                    data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+                    let _ = Shell_NotifyIconW(NIM_SETVERSION, &data);
+                }
+                registered
             } else {
                 let _ = Shell_NotifyIconW(NIM_DELETE, &data);
                 false
@@ -1296,5 +1532,58 @@ async fn client_loop(
             dest.post(move|a|if a.active(id){a.status("Serveur indisponible · nouvel essai dans trois secondes. Vérifiez l’adresse et l’association.");});
         }
         tokio::select! {_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(3))=>{}}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn embedded_icons_load_at_each_dpi_and_are_assigned_to_window() {
+        unsafe extern "system" fn window_proc(w: HWND, m: u32, p: WPARAM, l: LPARAM) -> LRESULT {
+            unsafe { DefWindowProcW(w, m, p, l) }
+        }
+        unsafe {
+            let window = hidden("MultiMachineRust.IconTest", Some(window_proc)).unwrap();
+            for dpi in [96, 120, 144, 192] {
+                let icons = Icons::load(dpi).unwrap();
+                icons.apply(window);
+                for (kind, expected, metric) in [
+                    (ICON_SMALL, icons.small, SM_CXSMICON),
+                    (ICON_BIG, icons.large, SM_CXICON),
+                ] {
+                    let actual =
+                        SendMessageW(window, WM_GETICON, Some(WPARAM(kind as usize)), None);
+                    assert_eq!(actual.0, expected.0 as isize);
+                    let mut info = ICONINFO::default();
+                    GetIconInfo(expected, &mut info).unwrap();
+                    let mut bitmap = BITMAP::default();
+                    assert_ne!(
+                        GetObjectW(
+                            info.hbmColor.into(),
+                            std::mem::size_of::<BITMAP>() as i32,
+                            Some((&mut bitmap as *mut BITMAP).cast())
+                        ),
+                        0
+                    );
+                    assert_eq!(bitmap.bmWidth, GetSystemMetricsForDpi(metric, dpi));
+                    let _ = DeleteObject(info.hbmColor.into());
+                    let _ = DeleteObject(info.hbmMask.into());
+                }
+                SendMessageW(
+                    window,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_SMALL as usize)),
+                    Some(LPARAM(0)),
+                );
+                SendMessageW(
+                    window,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_BIG as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            DestroyWindow(window).unwrap();
+        }
     }
 }
