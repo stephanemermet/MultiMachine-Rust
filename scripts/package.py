@@ -48,7 +48,7 @@ for pkg in sorted(metadata['packages'], key=lambda p: (p['name'], p['version']))
     notices += ['']
 (stage / 'THIRD-PARTY-NOTICES.md').write_text('\n'.join(notices), encoding='utf-8')
 zip_path = output / (name + '.zip')
-with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, strict_timestamps=False) as archive:
     for file in sorted(stage.rglob('*')):
         if file.is_file():
             archive.write(file, name + '/' + file.relative_to(stage).as_posix())
