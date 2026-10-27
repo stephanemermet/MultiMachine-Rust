@@ -1,0 +1,8 @@
+/target/
+/artifacts/
+/.local/
+*.pdb
+*.trust
+settings.json
+*.dpapi
+/DragCache/
