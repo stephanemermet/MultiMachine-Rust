@@ -42,7 +42,9 @@ Tous les fichiers de fonctionnement sont sous `%LOCALAPPDATA%\MultiMachineRust`.
 
 **Diagnostics** ouvre ce dossier. Les journaux contiennent les catégories d’opérations, les files réseau et le délai mesuré, sans texte copié, noms de fichiers ni clés. Pour changer de serveur, arrêter le client puis utiliser **Nouvelle association**. Sur un serveur déjà associé, ce bouton ouvre une nouvelle association pendant deux minutes. Quitter l’application avant de supprimer ses réglages ; ne pas effacer le journal de restauration des traces avant qu’il ait restauré le réglage Windows.
 
-Le dépôt GitHub et les releases doivent rester **privés**. La documentation de référence appartient au projet Fileaify **MultiMachine-rust** (`585cb53f-078c-4783-84cb-eec5e8ac447c`). Les fichiers de ce dépôt servent de guide de construction et de preuves techniques.
+Le dépôt GitHub et les releases sont **publics** depuis la décision du propriétaire du 28 octobre 2026. La documentation de référence appartient au projet Fileaify **MultiMachine-rust** (`585cb53f-078c-4783-84cb-eec5e8ac447c`). Les fichiers de ce dépôt servent de guide de construction et de preuves techniques. La publication ne change pas les droits réservés dans [LICENSE](LICENSE).
+
+Les commits et tags utilisent une identité publique et l’adresse GitHub `noreply`, jamais l’adresse personnelle du propriétaire. Avant de contribuer ou publier, appliquer la configuration locale et les contrôles décrits dans [AGENTS.md](AGENTS.md#identité-git-et-confidentialité).
 
 ## Construction
 
